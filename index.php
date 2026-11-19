@@ -18,11 +18,8 @@ if($page === 'login' && $_SERVER['REQUEST_METHOD'] === 'POST'){
         $key_input = $_POST['secret_key'] ?? '';
     }
 
-    // Bersihkan semua spasi dan enter dari inputan maupun kunci sistem
     $clean_input = preg_replace('/\s+/', '', $key_input);
     $clean_system = preg_replace('/\s+/', '', AES_SECRET_KEY);
-
-    // Validasi kecocokan
     $valid = ($clean_input === $clean_system && $clean_system !== '') ? AES_SECRET_KEY : '';
     
     session_regenerate_id(true);
@@ -31,16 +28,32 @@ if($page === 'login' && $_SERVER['REQUEST_METHOD'] === 'POST'){
     header('Location: index.php?page=admin'); exit;
 }
 
+// Fungsi Helper: Jika terkunci, seluruh teks UI ikut dienkripsi AES-256!
+function ui(string $text, bool $locked): string {
+    if (!$locked) return e($text);
+    // Panjang ciphertext disesuaikan proporsional agar tampilan tetap rapi
+    $cipher = aes_encrypt_str($text);
+    $len = max(12, min(strlen($cipher), strlen($text) * 2 + 8));
+    return '<span style="font-family:Consolas,monospace; letter-spacing:0.5px;">' . e(substr($cipher, 0, $len)) . '</span>';
+}
+
 if($page === 'admin'){
     if(empty($_SESSION['login'])){ header('Location: index.php?page=login'); exit; }
     $aes_key = $_SESSION['aes_key'] ?? '';
     $locked = ($aes_key === '');
     $pdo = db();
 
-    if(isset($_POST['status'], $_POST['id'])){
-        $pdo->prepare('UPDATE bookings SET status=? WHERE id=?')->execute([$_POST['status'], $_POST['id']]);
+    // Update status (dienkripsi saat disimpan ke DB)
+    if(!$locked && isset($_POST['status'], $_POST['id'])){
+        $enc_status = aes_encrypt_str($_POST['status']);
+        $pdo->prepare('UPDATE bookings SET status=? WHERE id=?')->execute([$enc_status, $_POST['id']]);
     }
-    $rows = $pdo->query('SELECT b.*, r.origin, r.destination, r.vehicle, r.price FROM bookings b JOIN routes r ON r.id=b.route_id ORDER BY b.id DESC')->fetchAll();
+    
+    $routes_map = [];
+    foreach($pdo->query('SELECT * FROM routes')->fetchAll() as $rt){
+        $routes_map[$rt['id']] = $rt;
+    }
+    $rows = $pdo->query('SELECT * FROM bookings ORDER BY id DESC')->fetchAll();
 }
 
 $msg = ''; $cek = null; $cekMsg = '';
@@ -64,8 +77,13 @@ if($page === 'home'){
                 'seats' => $seats
             ]);
 
+            $enc_route  = aes_encrypt_str((string)$_POST['route_id']);
+            $enc_date   = aes_encrypt_str((string)$_POST['travel_date']);
+            $enc_seats  = aes_encrypt_str((string)$seats);
+            $enc_status = aes_encrypt_str('pending');
+
             db()->prepare('INSERT INTO bookings(code, route_id, travel_date, seats, status, enc_data, enc_key) VALUES(?,?,?,?,?,?,?)')
-              ->execute([hash('sha256', $code), $_POST['route_id'], $_POST['travel_date'], $seats, 'pending', $enc_data, 'AES-256-CBC']);
+              ->execute([hash('sha256', $code), $enc_route, $enc_date, $enc_seats, $enc_status, $enc_data, 'AES-256-CBC']);
 
             $msg = '<div class="alert-box success">✨ Pemesanan Berhasil! Kode Booking Anda: <b>'.$code.'</b> (Simpan untuk cek status).</div>';
         }catch(Exception $ex){
@@ -74,10 +92,30 @@ if($page === 'home'){
     }
 
     if(!empty($_GET['kode'])){
-        $q = db()->prepare('SELECT b.travel_date, b.seats, b.status, r.origin, r.destination, r.vehicle, r.price 
-                            FROM bookings b JOIN routes r ON r.id=b.route_id WHERE b.code=?');
+        $q = db()->prepare('SELECT * FROM bookings WHERE code=?');
         $q->execute([hash('sha256', strtoupper(trim($_GET['kode'])))]);
-        $cek = $q->fetch();
+        $bk = $q->fetch();
+        if($bk){
+            $dec_r_id   = aes_decrypt_str($bk['route_id'], AES_SECRET_KEY);
+            $dec_date   = aes_decrypt_str($bk['travel_date'], AES_SECRET_KEY);
+            $dec_seat   = (int)aes_decrypt_str($bk['seats'], AES_SECRET_KEY);
+            $dec_status = aes_decrypt_str($bk['status'], AES_SECRET_KEY) ?? 'pending';
+            
+            $rq = db()->prepare('SELECT * FROM routes WHERE id=?');
+            $rq->execute([$dec_r_id]);
+            $rt_info = $rq->fetch();
+            if($rt_info){
+                $cek = [
+                    'status' => $dec_status,
+                    'origin' => $rt_info['origin'],
+                    'destination' => $rt_info['destination'],
+                    'vehicle' => $rt_info['vehicle'],
+                    'price' => $rt_info['price'],
+                    'travel_date' => $dec_date,
+                    'seats' => $dec_seat
+                ];
+            }
+        }
         if(!$cek) $cekMsg = '<div class="alert-box error">⚠️ Kode booking tidak ditemukan.</div>';
     }
     $routes = db()->query('SELECT * FROM routes')->fetchAll();
@@ -88,7 +126,7 @@ if($page === 'home'){
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TravelGo - Secure Ticket Booking (AES-256)</title>
+<title><?= ($page === 'admin' && $locked) ? substr(aes_encrypt_str('TravelGo'), 0, 16) : 'TravelGo - Secure Ticket Booking (AES-256)' ?></title>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -161,7 +199,11 @@ button:hover { background: var(--primary-dark); transform: translateY(-2px); }
 .passenger-name { font-weight: 700; color: #15803d; font-size: 14px; display: flex; align-items: center; gap: 6px; }
 .passenger-ktp { color: #64748b; font-size: 12px; margin-top: 4px; font-weight: 500; }
 .passenger-phone { color: #0f172a; font-weight: 700; font-size: 14px; display: flex; align-items: center; gap: 6px; }
-.cipher-box { background: #fafafa; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 8px 12px; font-family: Consolas, monospace; font-size: 11px; color: #334155; word-break: break-all; display: inline-flex; align-items: center; gap: 8px; max-width: 380px; }
+.cipher-text { font-family: Consolas, monospace; font-size: 11px; color: #475569; word-break: break-all; max-width: 190px; display: inline-block; background: #f8fafc; padding: 6px 8px; border-radius: 6px; border: 1px dashed #cbd5e1; }
+.status-select { width: auto; padding: 8px 12px; margin-bottom: 0; font-size: 13px; font-weight: 700; border-radius: 10px; cursor: pointer; }
+.status-pending { background: #fef3c7; color: #b45309; border-color: #fde68a; }
+.status-confirmed { background: #dcfce7; color: #15803d; border-color: #bbf7d0; }
+.status-cancelled { background: #fee2e2; color: #b91c1c; border-color: #fecaca; }
 </style>
 </head>
 <body>
@@ -172,20 +214,19 @@ button:hover { background: var(--primary-dark); transform: translateY(-2px); }
   <div class="login-card">
     <div class="icon-key">🔑</div>
     <h2>Otentikasi Kunci AES-256</h2>
-    <p style="color: var(--text-muted); font-size: 14px; margin-bottom: 24px;">Unggah file kunci (.pem/.txt) atau paste Kunci AES di bawah ini untuk dekripsi data:</p>
+    <p style="color: var(--text-muted); font-size: 14px; margin-bottom: 24px;">Unggah file kunci atau masukkan kunci dekripsi secara manual untuk mengakses data:</p>
 
     <form method="post" enctype="multipart/form-data">
       <div class="upload-box">
-        <label>📁 UPLOAD FILE KEY (.PEM / .TXT)</label>
+        <label>📁 UNGGAH FILE KUNCI (.PEM / .TXT)</label>
         <input type="file" name="file_key" accept=".pem,.txt,.key" style="width: 100%; border: 0; background: transparent; padding: 0; cursor: pointer;">
       </div>
 
-      <div class="divider">ATAU KETIK / PASTE KUNCI</div>
+      <div class="divider">ATAU INPUT KUNCI MANUAL</div>
 
       <div style="text-align: left; margin-bottom: 22px;">
-        <label><code>&lt;/&gt;</code> KUNCI RAHASIA AES-256</label>
-        <!-- Textarea besar supaya kunci 3 baris bisa terlihat dan dipaste dengan rapi -->
-        <textarea name="secret_key" rows="4" placeholder="Paste kunci -----BEGIN AES SECRET KEY----- di sini..." style="width: 100%; padding: 14px; border: 1px solid var(--border-color); border-radius: 14px; font-family: monospace; font-size: 12px; resize: vertical; margin-bottom:0;"></textarea>
+        <label><code>&lt;/&gt;</code> KUNCI DEKRIPSI AES-256</label>
+        <textarea name="secret_key" rows="4" placeholder="Masukkan kunci dekripsi Anda di sini..." style="width: 100%; padding: 14px; border: 1px solid var(--border-color); border-radius: 14px; font-family: monospace; font-size: 12px; resize: vertical; margin-bottom:0;"></textarea>
       </div>
 
       <button>Validasi & Buka Dashboard 🔒</button>
@@ -198,29 +239,29 @@ button:hover { background: var(--primary-dark); transform: translateY(-2px); }
 </div>
 
 <?php elseif($page === 'admin'): ?>
-<!-- DASHBOARD ADMIN -->
+<!-- DASHBOARD ADMIN (SELURUH TEKS OTOMATIS TERENKRIPSI JIKA TANPA KUNCI) -->
 <div class="admin-navbar">
-  <a href="#" class="admin-logo">TravelGo Admin</a>
+  <a href="#" class="admin-logo"><?= ui('TravelGo Admin', $locked) ?></a>
   <div style="display: flex; align-items: center;">
     <?php if(!$locked): ?>
       <span class="badge-key-active">🔑 Kunci AES Valid</span>
     <?php else: ?>
-      <span class="badge-key-locked">🔒 Tanpa Kunci</span>
+      <span class="badge-key-locked">🔒 <?= ui('Tanpa Kunci', $locked) ?></span>
     <?php endif; ?>
-    <a href="index.php?page=logout" class="btn-logout">[→ Keluar</a>
+    <a href="index.php?page=logout" class="btn-logout"><?= $locked ? ui('Keluar', $locked) : '[→ Keluar' ?></a>
   </div>
 </div>
 
 <div class="admin-container">
-  <h1 class="dash-title">Dashboard Manifes Penumpang</h1>
-  <p class="dash-subtitle">Sistem otomatis mendekripsi data sensitif (Nama, KTP, HP) menggunakan Kunci AES-256.</p>
+  <h1 class="dash-title"><?= ui('Dashboard Manifes Penumpang', $locked) ?></h1>
+  <p class="dash-subtitle"><?= ui('Sistem otomatis mendekripsi seluruh kolom transaksi menggunakan Kunci AES-256.', $locked) ?></p>
 
   <div class="stat-grid">
     <div class="stat-card">
       <div class="stat-icon-blue">🎫</div>
       <div>
-        <div class="stat-label">Total Pemesanan</div>
-        <h3 class="stat-val"><?= count($rows) ?> Tiket</h3>
+        <div class="stat-label"><?= ui('Total Pemesanan', $locked) ?></div>
+        <h3 class="stat-val"><?= ui(count($rows) . ' Tiket', $locked) ?></h3>
       </div>
     </div>
     <div class="stat-card">
@@ -233,8 +274,8 @@ button:hover { background: var(--primary-dark); transform: translateY(-2px); }
       <?php else: ?>
         <div class="stat-icon-red">🔒</div>
         <div>
-          <div class="stat-label">Status Data</div>
-          <h3 class="stat-val" style="color: #b91c1c;">Terkunci (Ciphertext)</h3>
+          <div class="stat-label"><?= ui('Status Data', $locked) ?></div>
+          <h3 class="stat-val" style="color: #b91c1c; font-size: 18px;"><?= ui('Terenkripsi (Ciphertext)', $locked) ?></h3>
         </div>
       <?php endif; ?>
     </div>
@@ -242,49 +283,76 @@ button:hover { background: var(--primary-dark); transform: translateY(-2px); }
 
   <div class="table-card">
     <div class="table-header-title">
-      📋 Daftar Penumpang <?= !$locked ? '(Data Asli)' : '(Terenkripsi AES-256)' ?>
+      📋 <?= !$locked ? 'Daftar Penumpang (Data Asli)' : ui('Daftar Penumpang (Terenkripsi Penuh AES-256)', $locked) ?>
     </div>
     
     <div style="overflow-x: auto;">
       <table class="custom-table">
         <thead>
           <tr>
-            <th>KODE</th>
-            <th>RUTE & TANGGAL</th>
-            <th>DATA PRIBADI (DECRYPTED)</th>
-            <th>KONTAK (DECRYPTED)</th>
-            <th>BENTUK ASLI DI DB (CIPHERTEXT)</th>
+            <th><?= ui('KODE', $locked) ?></th>
+            <th><?= ui('RUTE & TANGGAL', $locked) ?></th>
+            <th><?= ui('DATA PRIBADI', $locked) ?></th>
+            <th><?= ui('KONTAK & KURSI', $locked) ?></th>
+            <th><?= ui('STATUS PEMESANAN', $locked) ?></th>
           </tr>
         </thead>
         <tbody>
           <?php foreach($rows as $r):
-            $dec = $locked ? null : aes_decrypt($r['enc_data'], $aes_key);
+            $dec          = $locked ? null : aes_decrypt($r['enc_data'], $aes_key);
+            $dec_route_id = $locked ? null : aes_decrypt_str($r['route_id'], $aes_key);
+            $dec_date     = $locked ? null : aes_decrypt_str($r['travel_date'], $aes_key);
+            $dec_seats    = $locked ? null : aes_decrypt_str($r['seats'], $aes_key);
+            $dec_status   = $locked ? null : (aes_decrypt_str($r['status'], $aes_key) ?? 'pending');
+            $rt_obj       = ($dec_route_id && isset($routes_map[$dec_route_id])) ? $routes_map[$dec_route_id] : null;
           ?>
           <tr>
-            <td><span class="code-badge">TRV-<?= e($r['id'] * 1234 + 1000) ?></span></td>
             <td>
-              <div class="route-text"><?= e($r['origin']) ?> - <?= e($r['destination']) ?></div>
-              <div class="date-text">📅 <?= e($r['travel_date']) ?></div>
+              <?php if($dec): ?>
+                <span class="code-badge"><?= e($dec['code']) ?></span>
+              <?php else: ?>
+                <span class="cipher-text"><?= e(substr($r['code'], 0, 26)) ?>...</span>
+              <?php endif; ?>
+            </td>
+            <td>
+              <?php if($rt_obj && $dec_date): ?>
+                <div class="route-text"><?= e($rt_obj['origin']) ?> - <?= e($rt_obj['destination']) ?></div>
+                <div class="date-text">📅 <?= e($dec_date) ?></div>
+              <?php else: ?>
+                <div class="cipher-text" style="margin-bottom:4px;"><?= e(substr($r['route_id'], 0, 26)) ?></div><br>
+                <div class="cipher-text"><?= e(substr($r['travel_date'], 0, 26)) ?></div>
+              <?php endif; ?>
             </td>
             <td>
               <?php if($dec): ?>
                 <div class="passenger-name">👤 <?= e($dec['nama']) ?></div>
                 <div class="passenger-ktp">KTP: <?= e($dec['ktp']) ?></div>
               <?php else: ?>
-                <span style="color: #ef4444; font-size: 13px; font-weight: 600;">🔒 Terkunci</span>
+                <span class="cipher-text"><?= e(substr($r['enc_data'], 0, 34)) ?></span>
               <?php endif; ?>
             </td>
             <td>
-              <?php if($dec): ?>
+              <?php if($dec && $dec_seats): ?>
                 <div class="passenger-phone">💬 <?= e($dec['hp']) ?></div>
+                <div class="passenger-ktp">Kursi: <?= e($dec_seats) ?> Tiket</div>
               <?php else: ?>
-                <span style="color: #ef4444; font-size: 13px; font-weight: 600;">🔒 Terkunci</span>
+                <div class="cipher-text" style="margin-bottom:4px;"><?= e(substr($r['enc_data'], 34, 26)) ?></div><br>
+                <div class="cipher-text"><?= e(substr($r['seats'], 0, 26)) ?></div>
               <?php endif; ?>
             </td>
             <td>
-              <div class="cipher-box">
-                <span style="color: #ef4444;">🔒</span> <?= e(substr($r['enc_data'], 0, 42)) ?>==
-              </div>
+              <?php if(!$locked && $dec_status): ?>
+                <form method="post" style="margin:0;">
+                  <input type="hidden" name="id" value="<?= e($r['id']) ?>">
+                  <select name="status" onchange="this.form.submit()" class="status-select status-<?= e($dec_status) ?>">
+                    <option value="pending" <?= $dec_status==='pending'?'selected':'' ?>>⏳ Pending</option>
+                    <option value="confirmed" <?= $dec_status==='confirmed'?'selected':'' ?>>✅ Berhasil</option>
+                    <option value="cancelled" <?= $dec_status==='cancelled'?'selected':'' ?>>❌ Dibatalkan</option>
+                  </select>
+                </form>
+              <?php else: ?>
+                <span class="cipher-text"><?= e(substr($r['status'], 0, 28)) ?></span>
+              <?php endif; ?>
             </td>
           </tr>
           <?php endforeach; ?>
@@ -311,7 +379,7 @@ button:hover { background: var(--primary-dark); transform: translateY(-2px); }
   <p>Pesan tiket travel antar kota dengan jaminan perlindungan enkripsi tingkat tinggi untuk menjaga privasi data pribadi Anda.</p>
   
   <div class="hero-features-grid">
-    <div>🔒 Data KTP & HP Terenkripsi Otomatis</div>
+    <div>🔒 Seluruh Data Transaksi Terenkripsi Otomatis</div>
     <div>🚌 Armada Hiace & Bus Executive Nyaman</div>
     <div>🎫 Konfirmasi Instan dengan Kode Booking</div>
   </div>
@@ -352,13 +420,15 @@ button:hover { background: var(--primary-dark); transform: translateY(-2px); }
     <h2>🔍 Cek Status Pesanan Tiket</h2>
     <form method="get" action="#cek">
       <label>Masukkan Kode Booking:</label>
-      <input name="kode" placeholder="Contoh: TRV-A1B2C3" value="<?=e($_GET['kode'] ?? '')?>" required>
+      <input name="kode" placeholder="Contoh: TRV-1234" value="<?=e($_GET['kode'] ?? '')?>" required>
       <button style="background: var(--text-main);">Cek Status Pesanan</button>
     </form>
     <?=$cekMsg?>
     <?php if($cek): ?>
       <div style="margin-top: 20px; background: #f8fafc; border: 1px solid var(--primary); border-radius: 16px; padding: 20px;">
-        <span style="background: #dcfce7; color: #15803d; padding: 4px 12px; border-radius: 20px; font-weight: 700; font-size: 12px;"><?=e($cek['status'])?></span>
+        <span style="background: #dcfce7; color: #15803d; padding: 4px 12px; border-radius: 20px; font-weight: 700; font-size: 12px;">
+          <?= $cek['status'] === 'confirmed' ? '✅ Berhasil' : ($cek['status'] === 'cancelled' ? '❌ Dibatalkan' : '⏳ Pending') ?>
+        </span>
         <p style="margin: 14px 0 6px; font-weight: 700;">Rute: <?=e($cek['origin'])?> → <?=e($cek['destination'])?> (<?=e($cek['vehicle'])?>)</p>
         <p style="margin: 0; color: #64748b; font-size: 13px;">Tanggal: <?=e($cek['travel_date'])?> | Total: <?=rp($cek['price'] * $cek['seats'])?></p>
       </div>
